@@ -14,6 +14,8 @@ import uuid
 
 from octoprint.settings import settings
 
+from octoprint.database import *
+
 class UserManager(object):
 	valid_roles = ["user", "admin"]
 
@@ -241,6 +243,171 @@ class FilebasedUserManager(UserManager):
 
 	def hasBeenCustomized(self):
 		return self._customized
+
+##~~ DatabaseBasedUserManager, takes available users from SQLAlchemy connection
+
+class DatabaseBasedUserManager(UserManager):
+	def __init__(self):
+		print "DatabaseBasedUserManager Loaded!"
+		UserManager.__init__(self)
+
+		userfile = settings().get(["accessControl", "userfile"])
+		if userfile is None:
+			userfile = os.path.join(settings().settings_dir, "users.yaml")
+		self._userfile = userfile
+		self._users = {}
+		self._dirty = False
+
+		self._customized = None
+		db.create_all()
+
+		self._load()
+
+	def _load(self):
+		if os.path.exists(self._userfile) and os.path.isfile(self._userfile):
+			self._customized = True
+			for entry in DBUser.query.all():
+				data = yaml.safe_load(str(entry))
+				for name in data.keys():
+					attributes = data[name]
+					apikey = None
+					if "apikey" in attributes:
+						apikey = attributes["apikey"]
+					self._users[name] = User(name, attributes["password"], attributes["active"], attributes["roles"], apikey)
+		else:
+			self._customized = False
+
+	def _save(self, force=False):
+		if not self._dirty and not force:
+			return
+
+		data = {}
+		for name in self._users.keys():
+			user = self._users[name]
+			data[name] = {
+				"password": user._passwordHash,
+				"active": user._active,
+				"roles": user._roles,
+				"apikey": user._apikey
+			}
+
+		with open(self._userfile, "wb") as f:
+			yaml.safe_dump(data, f, default_flow_style=False, indent="    ", allow_unicode=True)
+			self._dirty = False
+		self._load()
+
+	def addUser(self, username, password, active=False, roles=None, apikey=None):
+		if not roles:
+			roles = ["user"]
+
+		if username in self._users.keys():
+			raise UserAlreadyExists(username)
+
+		self._users[username] = User(username, UserManager.createPasswordHash(password), active, roles, apikey)
+		self._dirty = True
+		self._save()
+
+	def changeUserActivation(self, username, active):
+		if not username in self._users.keys():
+			raise UnknownUser(username)
+
+		if self._users[username]._active != active:
+			self._users[username]._active = active
+			self._dirty = True
+			self._save()
+
+	def changeUserRoles(self, username, roles):
+		if not username in self._users.keys():
+			raise UnknownUser(username)
+
+		user = self._users[username]
+
+		removedRoles = set(user._roles) - set(roles)
+		self.removeRolesFromUser(username, removedRoles)
+
+		addedRoles = set(roles) - set(user._roles)
+		self.addRolesToUser(username, addedRoles)
+
+	def addRolesToUser(self, username, roles):
+		if not username in self._users.keys():
+			raise UnknownUser(username)
+
+		user = self._users[username]
+		for role in roles:
+			if not role in user._roles:
+				user._roles.append(role)
+				self._dirty = True
+		self._save()
+
+	def removeRolesFromUser(self, username, roles):
+		if not username in self._users.keys():
+			raise UnknownUser(username)
+
+		user = self._users[username]
+		for role in roles:
+			if role in user._roles:
+				user._roles.remove(role)
+				self._dirty = True
+		self._save()
+
+	def changeUserPassword(self, username, password):
+		if not username in self._users.keys():
+			raise UnknownUser(username)
+
+		passwordHash = UserManager.createPasswordHash(password)
+		user = self._users[username]
+		if user._passwordHash != passwordHash:
+			user._passwordHash = passwordHash
+			self._dirty = True
+			self._save()
+
+	def generateApiKey(self, username):
+		if not username in self._users.keys():
+			raise UnknownUser(username)
+
+		user = self._users[username]
+		user._apikey = ''.join('%02X' % ord(z) for z in uuid.uuid4().bytes)
+		self._dirty = True
+		self._save()
+		return user._apikey
+
+	def deleteApikey(self, username):
+		if not username in self._users.keys():
+			raise UnknownUser(username)
+
+		user = self._users[username]
+		user._apikey = None
+		self._dirty = True
+		self._save()
+
+	def removeUser(self, username):
+		if not username in self._users.keys():
+			raise UnknownUser(username)
+
+		del self._users[username]
+		self._dirty = True
+		self._save()
+
+	def findUser(self, username=None, apikey=None):
+		if username is not None:
+			if username not in self._users.keys():
+				return None
+
+			return self._users[username]
+		elif apikey is not None:
+			for user in self._users.values():
+				if apikey == user._apikey:
+					return user
+			return None
+		else:
+			return None
+
+	def getAllUsers(self):
+		return map(lambda x: x.asDict(), self._users.values())
+
+	def hasBeenCustomized(self):
+		return self._customized
+
 
 ##~~ Exceptions
 
